@@ -581,7 +581,7 @@ ${this.channels.map(channel =>
         let filteredCount = 0;
         
         // 获取过滤配置
-        const filterConfig = this.config.features.filterChannels || { enabled: false };
+        const filterConfig = this.config.features?.filterChannels || { enabled: false };
         const blacklistKeywords = filterConfig.blacklistKeywords || [];
         const whitelistKeywords = filterConfig.whitelistKeywords || [];
         
