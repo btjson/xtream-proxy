@@ -997,7 +997,8 @@ class TelegramBotManager {
                 { command: 'admin', description: '管理员面板' },
                 { command: 'addadmin', description: '添加管理员' },
                 { command: 'removeadmin', description: '移除管理员' },
-                { command: 'listadmins', description: '查看管理员列表' }
+                { command: 'listadmins', description: '查看管理员列表' },
+                { command: 'changem3u', description: '修改M3U订阅链接' }
             ];
             
             await this.bot.setMyCommands(adminCommands, {
