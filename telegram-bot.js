@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
 class TelegramBotManager {
     constructor(config, userManager) {
@@ -30,6 +31,65 @@ class TelegramBotManager {
         if (config.features.enableTelegramBot && this.config.botToken) {
             this.initializeBot();
         }
+        
+        // 初始化管理员列表
+        this.initializeAdminList();
+    }
+    
+    // 新增：初始化管理员列表
+    initializeAdminList() {
+        // 支持旧配置格式的兼容性
+        if (this.config.adminUserId && !this.config.adminUserIds) {
+            this.config.adminUserIds = [this.config.adminUserId];
+        }
+        
+        // 确保管理员列表存在
+        if (!this.config.adminUserIds) {
+            this.config.adminUserIds = [];
+        }
+        
+        console.log(`✅ Initialized admin list: ${this.config.adminUserIds.length} admins`);
+    }
+    
+    // 新增：检查用户是否为管理员
+    isAdmin(userId) {
+        const userIdStr = userId.toString();
+        
+        // 检查新格式的管理员列表
+        if (this.config.adminUserIds?.includes(userIdStr)) {
+            return true;
+        }
+        
+        // 兼容旧格式
+        if (this.config.adminUserId === userIdStr) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // 新增：获取主管理员ID（用于通知）
+    getPrimaryAdminId() {
+        if (this.config.adminUserIds?.length > 0) {
+            return this.config.adminUserIds[0];
+        }
+        return this.config.adminUserId || null;
+    }
+    
+    // 新增：获取所有管理员ID
+    getAllAdminIds() {
+        const adminIds = [];
+        
+        if (this.config.adminUserIds) {
+            adminIds.push(...this.config.adminUserIds);
+        }
+        
+        // 兼容旧格式
+        if (this.config.adminUserId && !adminIds.includes(this.config.adminUserId)) {
+            adminIds.push(this.config.adminUserId);
+        }
+        
+        return adminIds;
     }
     
     // 确保数据目录存在
@@ -208,16 +268,51 @@ class TelegramBotManager {
     // 设置机器人命令菜单
     async setupBotCommands() {
         try {
-            const commands = [
+            // 普通用户命令
+            const userCommands = [
                 { command: 'start', description: '开始使用机器人' },
                 { command: 'gettoken', description: '获取访问token' },
                 { command: 'mycredentials', description: '查看我的凭据' },
+                { command: 'status', description: '查看使用状态' },
                 { command: 'help', description: '显示帮助信息' },
                 { command: 'revoke', description: '撤销我的访问权限' }
             ];
             
-            await this.bot.setMyCommands(commands);
-            console.log('✅ Bot commands menu set successfully');
+            // 管理员命令（包含普通用户命令 + 管理员专用命令）
+            const adminCommands = [
+                { command: 'start', description: '开始使用机器人' },
+                { command: 'gettoken', description: '获取访问token' },
+                { command: 'mycredentials', description: '查看我的凭据' },
+                { command: 'status', description: '查看使用状态' },
+                { command: 'help', description: '显示帮助信息' },
+                { command: 'revoke', description: '撤销我的访问权限' },
+                { command: 'refresh', description: '🔧 手动刷新原始服务器' },
+                { command: 'admin', description: '🛠️ 管理员命令面板' },
+                { command: 'addadmin', description: '👑 添加新管理员' },
+                { command: 'removeadmin', description: '🚫 移除管理员' },
+                { command: 'listadmins', description: '📋 查看管理员列表' }
+            ];
+            
+            // 设置默认命令（普通用户）
+            await this.bot.setMyCommands(userCommands);
+            
+            // 为所有管理员设置专用命令菜单
+            const adminIds = this.getAllAdminIds();
+            for (const adminId of adminIds) {
+                try {
+                    await this.bot.setMyCommands(adminCommands, {
+                        scope: {
+                            type: 'chat',
+                            chat_id: parseInt(adminId)
+                        }
+                    });
+                    console.log(`✅ Admin commands set for admin: ${adminId}`);
+                } catch (error) {
+                    console.warn(`⚠️ Could not set admin commands for ${adminId}:`, error.message);
+                }
+            }
+            
+            console.log('✅ Bot commands menu updated successfully');
         } catch (error) {
             console.error('❌ Failed to set bot commands:', error);
         }
@@ -239,6 +334,11 @@ class TelegramBotManager {
             this.handleMyCredentialsCommand(msg);
         });
         
+        // 处理 /status 命令
+        this.bot.onText(/\/status/, (msg) => {
+            this.handleStatusCommand(msg);
+        });
+        
         // 处理 /help 命令
         this.bot.onText(/\/help/, (msg) => {
             this.handleHelpCommand(msg);
@@ -249,9 +349,19 @@ class TelegramBotManager {
             this.handleRevokeCommand(msg);
         });
         
-        // 处理管理员命令（仅私聊）
-        this.bot.onText(/\/admin (.+)/, (msg, match) => {
-            this.handleAdminCommand(msg, match[1]);
+        // 新增：处理 /refresh 命令（管理员专用）
+        this.bot.onText(/\/refresh/, (msg) => {
+            this.handleRefreshCommand(msg);
+        });
+        
+        // 处理 /admin 命令（管理员专用）
+        this.bot.onText(/\/admin\s*(.*)/, (msg, match) => {
+            const command = match[1].trim() || '';
+            if (command) {
+                this.handleAdminCommand(msg, command);
+            } else {
+                this.handleAdminPanel(msg);
+            }
         });
         
         // 处理token验证（仅私聊）
@@ -279,6 +389,24 @@ class TelegramBotManager {
         // 错误处理
         this.bot.on('error', (error) => {
             console.error('Telegram bot error:', error);
+        });
+        
+        // 新增：处理管理员管理命令
+        this.bot.onText(/\/addadmin/, (msg) => {
+            this.handleAddAdminCommand(msg);
+        });
+        
+        this.bot.onText(/\/removeadmin/, (msg) => {
+            this.handleRemoveAdminCommand(msg);
+        });
+        
+        this.bot.onText(/\/listadmins/, (msg) => {
+            this.handleListAdminsCommand(msg);
+        });
+        
+        // 新增：处理检查管理员状态命令（调试用）
+        this.bot.onText(/\/checkadmin/, (msg) => {
+            this.handleCheckAdminCommand(msg);
         });
     }
     
@@ -393,41 +521,45 @@ class TelegramBotManager {
         if (msg.chat.type !== 'private') {
             return;
         }
-        
+
         const welcomeMessage = `
-🎬 **欢迎使用IPTV访问机器人！**
+🎬 **欢迎使用智能IPTV播放列表机器人！**
 
-📺 通过此机器人，您可以获取专属的IPTV访问凭据。
+📺 **核心特性：**
+• 🔐 **加密链接保护** - 防止直接复制使用
+• 📱 **多设备支持** - 最多3个设备同时使用
+• ⏰ **智能有效期** - 链接默认长期有效
 
-🔧 **快速开始：**
+🚀 **使用流程：**
 
-1️⃣ **确保群组成员身份**
-   • 您必须是指定IPTV群组的成员
-
-2️⃣ **获取访问Token**
+1️⃣ **获取Token** (10分钟有效)
    • 发送 \`/gettoken\` 命令
+   • 24小时内最多生成2次
 
-3️⃣ **验证Token**
-   • 将收到的token直接发送给机器人
+2️⃣ **兑换链接** (10分钟内兑换)
+   • 将token发送给机器人
+   • 获得播放列表链接
 
-4️⃣ **获得凭据**
-   • 收到您的专属IPTV访问信息
+3️⃣ **长期使用**
+   • 链接默认长期有效
+   • 5小时内刷新不超过6次
 
 📋 **可用命令：**
 • \`/gettoken\` - 获取访问token
 • \`/mycredentials\` - 查看我的凭据
-• \`/revoke\` - 撤销访问权限
-• \`/help\` - 详细使用指南
+• \`/revoke\` - 撤销我的访问权限
+• \`/help\` - 显示帮助信息
 
-⚠️ **重要提醒：**
-• 每5小时最多生成2个token
-• 播放列表5小时内最多请求2次
+⚠️ **重要规则：**
+• Token必须在10分钟内兑换，否则失效
+• 24小时内最多生成2个token
+• 播放列表5小时内刷新超过6次将失效
 • 离开群组后访问权限自动撤销
 
 发送 \`/help\` 获取详细使用指南。
     `;
     
-    await this.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+        await this.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
     }
     
     async handleGetTokenCommand(msg) {
@@ -472,7 +604,7 @@ class TelegramBotManager {
             await this.bot.sendMessage(chatId, `
 🚫 **Token生成限制已达上限**
 
-您在5小时内已生成了 ${limitCheck.count}/${limitCheck.maxCount} 个token。
+您在24小时内已生成了 ${limitCheck.count}/${limitCheck.maxCount} 个token。
 
 ⏰ **重置时间：** ${limitCheck.remainingTime} 分钟后
 
@@ -480,7 +612,7 @@ class TelegramBotManager {
 1. 等待 ${limitCheck.remainingTime} 分钟后重试
 2. 或使用 \`/revoke\` 撤销现有凭据后重新生成
 
-💡 **提示：** 为避免频繁生成token，请妥善保管您的凭据。
+💡 **提示：** 为避免频繁生成token，请在10分钟内及时兑换。
             `, { parse_mode: 'Markdown' });
             return;
         }
@@ -495,10 +627,10 @@ class TelegramBotManager {
 
 🔄 **解决方案：**
 1. 使用现有的token获取凭据
-2. 或等待现有token过期
+2. 或等待现有token过期（10分钟）
 3. 或使用 \`/revoke\` 命令清理现有凭据
 
-💡 **提示：** 每个token有效期为 ${Math.floor(this.config.tokenExpiry / 3600000)} 小时。
+💡 **提示：** 请在10分钟内使用token兑换播放列表。
             `, { parse_mode: 'Markdown' });
             return;
         }
@@ -532,15 +664,16 @@ class TelegramBotManager {
 \`${token}\`
 
 ⏰ **有效期：** ${expiryMinutes} 分钟
-📊 **生成统计：** ${limitCheck2.count}/${limitCheck2.maxCount} (5小时内)
+📊 **生成统计：** ${limitCheck2.count}/${limitCheck2.maxCount} (24小时内)
 
 📝 **下一步：**
-直接发送此token给机器人即可获取您的IPTV凭据。
+请在10分钟内将此token直接发送给机器人兑换播放列表。
 
-⚠️ **注意事项：**
+⚠️ **重要提醒：**
 • 此token只能使用一次
-• 请在有效期内使用
+• 必须在10分钟内兑换，否则失效
 • 不要分享给他人
+• 兑换后的播放列表长期有效
         `, { parse_mode: 'Markdown' });
         
     } catch (error) {
@@ -622,37 +755,35 @@ class TelegramBotManager {
             // 保存tokens数据
             this.saveTokensData();
             
-            // 生成各种播放链接
+            // 获取当前token生成限制信息
+            const limitCheck = this.checkTokenGenerationLimit(userId);
+            
+            // 生成播放链接 - 只保留M3U Plus链接
             const serverUrl = this.getServerUrl();
             const m3uLink = `${serverUrl}/get.php?username=${credentials.username}&password=${credentials.password}&type=m3u_plus`;
-            const m3uSimpleLink = `${serverUrl}/get.php?username=${credentials.username}&password=${credentials.password}&type=m3u`;
-            const playerApiLink = `${serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}`;
             
             const credentialsMessage = `
-🎉 恭喜！您的IPTV访问凭据已生成：
+🎉 **恭喜！您的IPTV播放列表已生成**
 
-📺 基本信息：
+📺 **基本信息：**
 🌐 服务器地址: \`${serverUrl}\`
 👤 用户名: \`${credentials.username}\`
 🔐 密码: \`${credentials.password}\`
 🔗 最大连接数: ${credentials.maxConnections}
 
-📱 直接播放链接：
+📱 **播放列表链接：**
 
-🎬 **M3U Plus播放列表** (推荐):
+🎬 **M3U Plus播放列表**:
 \`${m3uLink}\`
 
-📺 **M3U简单播放列表**:
-\`${m3uSimpleLink}\`
+✨ **重要特性：**
+• 🔐 **加密保护** - 链接已加密，无法直接复制频道
+• ⏰ **长期有效** - 默认长期有效，无需频繁更新
+• 📱 **多设备支持** - 最多3台设备同时使用
+• 🛡️ **智能管理** - 5小时内刷新超过6次将自动失效
 
-🔧 **Player API接口**:
-\`${playerApiLink}\`
+📖 **使用方法：**
 
-⚠️ **请求限制提醒：**
-- 播放列表链接在5小时内最多只能请求2次
-- 超过限制后链接将失效，需要重新生成token
-
-📖 使用方法：
 **方法1 - 直接导入播放列表：**
 1. 复制上面的M3U Plus链接
 2. 在IPTV播放器中选择"添加播放列表"
@@ -664,11 +795,14 @@ class TelegramBotManager {
 3. 用户名: \`${credentials.username}\`
 4. 密码: \`${credentials.password}\`
 
-⚠️ 重要提醒：
-- 请妥善保管这些凭据和链接
-- 不要与他人分享
-- 如需撤销访问权限，请使用 /revoke 命令
-            `;
+⚠️ **使用提醒：**
+• 链接默认长期有效，请妥善保管
+• 避免在5小时内刷新超过6次
+• 不要与他人分享您的凭据
+• 最多支持3台设备同时使用
+
+🎯 **下次获取：** 24小时内还可以生成 ${2 - (limitCheck.count || 1)} 次token
+`;
             
             await this.bot.sendMessage(chatId, credentialsMessage, { parse_mode: 'Markdown' });
             
@@ -700,12 +834,12 @@ class TelegramBotManager {
             await this.bot.sendMessage(chatId, `
 ❌ **没有找到凭据**
 
-您还没有生成IPTV访问凭据。
+您还没有生成IPTV播放列表。
 
-🔄 **获取凭据：**
+🔄 **获取播放列表：**
 1. 发送 \`/gettoken\` 获取访问token
 2. 将收到的token发送给机器人
-3. 获得您的专属IPTV凭据
+3. 获得您的专属IPTV播放列表
 
 需要帮助请发送 \`/help\` 查看详细指南。
         `, { parse_mode: 'Markdown' });
@@ -725,14 +859,12 @@ class TelegramBotManager {
             return;
         }
         
-        // 生成播放链接
+        // 生成播放链接 - 只保留M3U Plus链接
         const serverUrl = this.getServerUrl();
         const m3uLink = `${serverUrl}/get.php?username=${credentials.username}&password=${credentials.password}&type=m3u_plus`;
-        const m3uSimpleLink = `${serverUrl}/get.php?username=${credentials.username}&password=${credentials.password}&type=m3u`;
-        const playerApiLink = `${serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}`;
         
         const credentialsMessage = `
-📺 **您的IPTV访问凭据**
+📺 **您的IPTV播放列表凭据**
 
 🌐 **服务器地址：** \`${serverUrl}\`
 👤 **用户名：** \`${credentials.username}\`
@@ -741,29 +873,31 @@ class TelegramBotManager {
 
 📱 **播放列表链接：**
 
-🎬 **M3U Plus** (推荐):
+🎬 **M3U Plus播放列表**:
 \`${m3uLink}\`
 
-📺 **M3U简单格式**:
-\`${m3uSimpleLink}\`
-
-🔧 **Player API接口**:
-\`${playerApiLink}\`
-
-⚠️ **使用限制提醒：**
-• 播放列表链接5小时内最多请求2次
-• 超过限制后需重新生成token
-• 建议下载后保存到本地使用
+✨ **链接特性：**
+• 🔐 加密保护，无法直接复制频道链接
+• ⏰ 默认长期有效
+• 📱 最多支持3台设备同时使用
+• 🛡️ 5小时内刷新超过6次将失效
 
 📖 **使用方法：**
+**直接导入播放列表：**
 1. 复制M3U Plus链接
 2. 在IPTV播放器中导入
 3. 或使用Xtream Codes配置
 
+💡 **使用建议：**
+• 避免频繁刷新播放列表
+• 合理分配多设备使用
+• 妥善保管凭据信息
+
 🔄 **管理命令：**
 • \`/revoke\` - 撤销当前凭据
 • \`/gettoken\` - 重新生成token
-    `;
+• \`/revoke\` - 撤销访问权限
+`;
         
         await this.bot.sendMessage(chatId, credentialsMessage, { parse_mode: 'Markdown' });
     }
@@ -784,12 +918,12 @@ class TelegramBotManager {
             await this.bot.sendMessage(chatId, `
 ❌ **没有找到凭据**
 
-您还没有生成过IPTV访问凭据。
+您还没有生成过IPTV播放列表。
 
-🔄 **获取凭据：**
+🔄 **获取播放列表：**
 1. 发送 \`/gettoken\` 获取访问token
 2. 将收到的token发送给机器人
-3. 获得您的专属IPTV凭据
+3. 获得您的专属IPTV播放列表
 
 需要帮助请发送 \`/help\` 查看详细指南。
         `, { parse_mode: 'Markdown' });
@@ -803,17 +937,23 @@ class TelegramBotManager {
             await this.bot.sendMessage(chatId, `
 ✅ **访问权限已撤销**
 
-您的IPTV访问凭据已被成功撤销。
+您的IPTV播放列表已被成功撤销，所有相关链接已失效。
 
 🔄 **重新获取访问权限：**
 1. 发送 \`/gettoken\` 命令获取新token
 2. 将新token发送给机器人
-3. 获得新的凭据和播放列表链接
+3. 获得新的播放列表链接
 
 💡 **提示：**
-• 新凭据将重置所有使用限制
-• 播放列表请求限制重新计算
-• 旧的播放列表链接将失效
+• 新播放列表将重置所有使用统计
+• 播放列表请求计数重新开始
+• 旧的播放列表链接将完全失效
+• 您的永久用户状态（如有）将被保留
+
+🌟 **重新开始的好处：**
+• 清理所有旧的播放列表
+• 重置使用限制计数
+• 获得全新的加密链接
 
 如需帮助，请发送 \`/help\` 查看使用指南。
         `, { parse_mode: 'Markdown' });
@@ -829,83 +969,133 @@ class TelegramBotManager {
         const userId = msg.from.id;
         const isPrivateChat = msg.chat.type === 'private';
         const isInGroup = chatId.toString() === this.config.groupId;
+        const isAdmin = this.isAdmin(userId); // 使用新的验证方法
         
         if (isPrivateChat) {
-            // 私聊中的完整帮助信息
-            const helpMessage = `
-🤖 **IPTV访问机器人使用指南**
+            // 私聊中的帮助信息
+            let helpMessage = '';
+            
+            if (isAdmin) {
+                // 管理员看到管理员命令优先
+                helpMessage = `
+🔧 **管理员专用命令**
+
+🛠️ **服务器管理：**
+• \`/refresh\` - 手动刷新原始服务器
+• \`/admin stats\` - 查看系统统计
+• \`/admin list\` - 查看所有用户
+• \`/admin cleanup\` - 清理过期数据
+• \`/admin backup\` - 备份用户数据
+• \`/admin restore\` - 恢复用户数据
+• \`/admin delete <用户名>\` - 删除指定用户
+• \`/admin delete_id <Telegram用户ID>\` - 按ID删除用户
+
+📊 **监控命令：**
+• \`/status\` - 查看服务器状态
+
+---
+
+🤖 **普通用户命令**
+
+📋 **基本功能：**
+• \`/gettoken\` - 获取访问token
+• \`/mycredentials\` - 查看我的凭据
+• \`/revoke\` - 撤销访问权限
+• \`/help\` - 显示此帮助信息
+
+📖 **使用流程：**
+
+1️⃣ **获取Token**
+   • 发送 \`/gettoken\` 命令
+   • Token有效期：10分钟
+   • 24小时内限制生成2次
+
+2️⃣ **兑换凭据**
+   • 将收到的token直接发送给机器人
+   • 获得专属IPTV播放列表
+   • 链接默认长期有效
+
+3️⃣ **使用播放列表**
+   • 复制M3U Plus链接到IPTV播放器
+   • 或使用Xtream Codes配置方式
+
+⚠️ **重要说明：**
+• Token有效期10分钟，过期需重新生成
+• 链接5小时内刷新超过6次将失效
+• 每个用户最多3台设备同时使用
+• 必须保持群组成员身份
+
+💡 **推荐IPTV播放器：**
+• IPTV Smarters Pro
+• TiviMate
+• Perfect Player
+• GSE Smart IPTV
+
+如需技术支持，请联系管理员。
+            `;
+            } else {
+                // 普通用户帮助信息
+                helpMessage = `
+🤖 **智能IPTV播放列表机器人使用指南**
 
 📋 **可用命令：**
 
 🎫 \`/gettoken\` - 获取访问token
 📺 \`/mycredentials\` - 查看我的凭据
-🚫 \`/revoke\` - 撤销我的访问权限
+🚫 \`/revoke\` - 撤销访问权限
 ❓ \`/help\` - 显示此帮助信息
 
-📖 **使用流程：**
+📖 **详细使用流程：**
 
 1️⃣ **获取Token**
-   • 私聊机器人发送 \`/gettoken\`
-   • 系统会验证您是否在指定群组中
-   • 每5小时最多可获取2个token
+   • 发送 \`/gettoken\` 命令
+   • Token有效期：10分钟
+   • 24小时内限制生成2次
 
-2️⃣ **验证Token**
-   • 收到token后，直接发送给机器人
-   • 系统会生成您的专属IPTV凭据
+2️⃣ **兑换凭据**
+   • 将收到的token直接发送给机器人
+   • 获得专属IPTV播放列表
+   • 链接默认长期有效
 
-3️⃣ **使用凭据**
-   • 获得M3U播放列表链接
-   • 在IPTV播放器中导入链接
-   • 开始观看节目
+3️⃣ **使用播放列表**
+   • 复制M3U Plus链接到IPTV播放器
+   • 或使用Xtream Codes配置方式
 
-⚠️ **重要限制：**
+⚠️ **重要说明：**
+• Token有效期10分钟，过期需重新生成
+• 链接5小时内刷新超过6次将失效
+• 每个用户最多3台设备同时使用
+• 必须保持群组成员身份
 
-🔄 **Token生成限制**
-- 每个用户5小时内最多生成2个token
-- 超过限制需等待重置时间
+💡 **推荐IPTV播放器：**
+• IPTV Smarters Pro
+• TiviMate
+• Perfect Player
+• GSE Smart IPTV
 
-📺 **播放列表限制**
-- 每个凭据5小时内最多请求播放列表2次
-- 超过限制后凭据失效，需重新生成
-
-🔐 **群组验证**
-- 必须是指定群组成员才能使用
-- 离开群组后访问权限自动撤销
-
-�� **使用建议：**
-- 下载播放列表后保存到本地
-- 避免频繁刷新播放列表
-- 妥善保管凭据，不要分享给他人
-
-如有问题，请联系管理员。
+如需技术支持，请联系管理员。
             `;
+            }
             
             await this.bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
             
         } else if (isInGroup) {
-            // 群聊中的简化帮助信息
-            const groupHelpMessage = `
-🤖 **IPTV访问机器人**
+            // 群组中的简化帮助信息
+            await this.bot.sendMessage(chatId, `
+📺 **IPTV播放列表机器人**
 
-📱 **私聊机器人获取IPTV访问权限**
+🔒 请私聊机器人获取详细使用帮助和IPTV播放列表。
 
-🔧 **主要功能：**
-• 生成专属IPTV访问凭据
-• 提供M3U播放列表链接
-• 支持Xtream Codes协议
+💬 **快速开始：**
+1. 点击 [@${this.bot.options.username || 'bot'}](https://t.me/${this.bot.options.username || 'bot'}) 私聊机器人
+2. 发送 \`/gettoken\` 获取访问token
+3. 使用收到的token获取播放列表
 
-⚠️ **使用说明：**
-• 请私聊机器人使用所有功能
-• 发送 \`/help\` 到私聊获取详细指南
-• 仅群组成员可使用此服务
-
-👆 点击机器人头像开始私聊
-            `;
-            
-            await this.bot.sendMessage(chatId, groupHelpMessage, { parse_mode: 'Markdown' });
-        } else {
-            // 非指定群组
-            await this.bot.sendMessage(chatId, '❌ 此机器人只能在指定群组中使用。');
+⚠️ **注意：** 必须是本群组成员才能使用服务。
+        `, { 
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        });
         }
     }
     
@@ -913,60 +1103,92 @@ class TelegramBotManager {
         const chatId = msg.chat.id;
         const userId = msg.from.id;
         
-        // 检查是否为管理员
-        if (userId.toString() !== this.config.adminUserId) {
-            await this.bot.sendMessage(chatId, '❌ 您没有管理员权限。');
+        // 只在私聊中处理
+        if (msg.chat.type !== 'private') {
+            await this.bot.sendMessage(chatId, '🔒 请私聊机器人使用管理员命令。');
             return;
         }
         
-        const [action, ...params] = command.split(' ');
+        // 验证管理员权限
+        if (!this.isAdmin(userId)) {
+            await this.bot.sendMessage(chatId, '❌ 此命令仅限管理员使用。');
+            return;
+        }
         
-        switch (action) {
-            case 'stats':
-                await this.handleAdminStats(chatId);
-                break;
-            case 'cleanup':
-                await this.handleAdminCleanup(chatId);
-                break;
-            case 'list':
-                await this.handleAdminList(chatId);
-                break;
-            case 'delete':
-                if (params.length > 0) {
-                    await this.handleAdminDeleteUser(chatId, params[0]);
-                } else {
-                    await this.bot.sendMessage(chatId, '❌ 请指定要删除的用户ID或用户名。\n用法: /admin delete <用户ID或用户名>');
-                }
-                break;
-            case 'deletebyid':
-                if (params.length > 0) {
-                    await this.handleAdminDeleteUserById(chatId, params[0]);
-                } else {
-                    await this.bot.sendMessage(chatId, '❌ 请指定要删除的Telegram用户ID。\n用法: /admin deletebyid <Telegram用户ID>');
-                }
-                break;
-            case 'backup':
-                await this.handleAdminBackup(chatId);
-                break;
-            case 'restore':
-                await this.handleAdminRestore(chatId);
-                break;
-            default:
-                await this.bot.sendMessage(chatId, `
-🔧 管理员命令：
+        // 解析命令和参数
+        const parts = command.trim().split(/\s+/);
+        const mainCommand = parts[0].toLowerCase();
+        const args = parts.slice(1);
+        
+        try {
+            switch (mainCommand) {
+                case 'statistics':
+                    await this.handleAdminStats(chatId);
+                    break;
+                    
+                case 'list':
+                    await this.handleAdminList(chatId);
+                    break;
+                    
+                case 'cleanup':
+                case 'clean':
+                    await this.handleAdminCleanup(chatId);
+                    break;
+                    
+                case 'backup':
+                    await this.handleAdminBackup(chatId);
+                    break;
+                    
+                case 'restore':
+                    await this.handleAdminRestore(chatId);
+                    break;
+                    
+                case 'delete':
+                    if (args.length > 0) {
+                        await this.handleAdminDeleteUser(chatId, args[0]);
+                    } else {
+                        await this.bot.sendMessage(chatId, '❌ 请指定要删除的用户名。\n用法: `/admin delete <用户名>`', { parse_mode: 'Markdown' });
+                    }
+                    break;
+                    
+                case 'delete_id':
+                    if (args.length > 0) {
+                        await this.handleAdminDeleteUserById(chatId, args[0]);
+                    } else {
+                        await this.bot.sendMessage(chatId, '❌ 请指定要删除的Telegram用户ID。\n用法: `/admin delete_id <用户ID>`', { parse_mode: 'Markdown' });
+                    }
+                    break;
+                    
+                case 'refresh':
+                    await this.handleRefreshCommand(msg);
+                    break;
+                    
+                case 'help':
+                case '':
+                    await this.handleAdminPanel(msg);
+                    break;
+                    
+                default:
+                    await this.bot.sendMessage(chatId, `
+❌ **未知的管理员命令: ${mainCommand}**
 
-/admin stats - 查看统计信息
-/admin cleanup - 清理过期token
-/admin list - 列出所有用户
-/admin delete <用户名> - 删除指定用户名的用户
-/admin deletebyid <用户ID> - 删除指定Telegram ID的用户
-/admin backup - 备份用户数据
-/admin restore - 恢复用户数据
+🛠️ **可用的管理员命令：**
+• \`statistics\` - 查看系统统计
+• \`list\` - 查看用户列表  
+• \`cleanup\` - 清理过期数据
+• \`backup\` - 备份数据
+• \`restore\` - 恢复数据
+• \`delete <用户名>\` - 删除用户
+• \`delete_id <用户ID>\` - 按ID删除用户
+• \`refresh\` - 刷新服务器
 
-📝 示例：
-/admin delete tg_12345678
-/admin deletebyid 123456789
-                `);
+或发送 \`/admin\` 查看完整管理面板。
+                    `, { parse_mode: 'Markdown' });
+                    break;
+            }
+        } catch (error) {
+            console.error(`Error executing admin command ${mainCommand}:`, error);
+            await this.bot.sendMessage(chatId, `❌ 执行管理员命令时发生错误: ${error.message}`);
         }
     }
     
@@ -1189,8 +1411,8 @@ class TelegramBotManager {
     checkTokenGenerationLimit(userId) {
         const now = Date.now();
         const limitData = this.tokenLimits.get(userId);
-        const maxTokensPerPeriod = 2; // 5小时内最多2个token
-        const limitPeriod = 5 * 60 * 60 * 1000; // 5小时
+        const maxTokensPerPeriod = this.config.maxTokensPerUser || 2; // 24小时内最多2个
+        const limitPeriod = this.config.tokenGenerationPeriod || 86400000; // 24小时
         
         if (!limitData || now > limitData.resetTime) {
             // 没有限制记录或已过期，允许生成
@@ -1225,7 +1447,7 @@ class TelegramBotManager {
     // 增加token生成计数
     incrementTokenGenerationCount(userId) {
         const now = Date.now();
-        const limitPeriod = 5 * 60 * 60 * 1000; // 5小时
+        const limitPeriod = this.config.tokenGenerationPeriod || 86400000; // 24小时
         let limitData = this.tokenLimits.get(userId);
         
         if (!limitData || now > limitData.resetTime) {
@@ -1327,6 +1549,235 @@ class TelegramBotManager {
             }
         }
         return false;
+    }
+    
+    // 新增：用户状态查看命令
+    async handleStatusCommand(msg) {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        
+        // 只在私聊中处理
+        if (msg.chat.type !== 'private') {
+            await this.bot.sendMessage(chatId, '🔒 请私聊机器人查看您的状态信息。');
+            return;
+        }
+        
+        const credentials = this.userCredentials.get(userId);
+        
+        if (!credentials) {
+            await this.bot.sendMessage(chatId, `
+❌ **没有找到凭据**
+
+您还没有生成IPTV播放列表。
+
+🔄 **获取播放列表：**
+1. 发送 \`/gettoken\` 获取访问token
+2. 将收到的token发送给机器人
+3. 获得您的专属IPTV播放列表
+
+需要帮助请发送 \`/help\` 查看详细指南。
+        `, { parse_mode: 'Markdown' });
+            return;
+        }
+        
+        // 获取用户在服务器端的状态信息
+        try {
+            const serverUrl = this.getServerUrl();
+            const response = await axios.get(`${serverUrl}/api/user-status?username=${credentials.username}`, {
+                timeout: 5000
+            }).catch(() => null);
+            
+            let userStatus = {
+                activePlaylists: 0,
+                requestsUsed: 0,
+                requestsRemaining: 5,
+                totalRequests: 0
+            };
+            
+            if (response && response.data) {
+                userStatus = response.data;
+            }
+            
+            // 获取token生成限制信息
+            const limitCheck = this.checkTokenGenerationLimit(userId);
+            
+            const statusMessage = `
+📊 **您的使用状态**
+
+👤 **用户信息：**
+• 用户名: \`${credentials.username}\`
+• 注册时间: ${new Date(credentials.createdAt).toLocaleString('zh-CN')}
+• 用户等级: 📺 **IPTV用户**
+
+📱 **播放列表状态：**
+• 当前活跃播放列表: ${userStatus.activePlaylists}/3
+• 5小时内请求次数: ${userStatus.requestsUsed}/6
+• 剩余请求次数: ${6 - userStatus.requestsUsed}
+• 历史总请求: ${userStatus.totalRequests}
+
+✨ **用户特权：**
+• 🌟 播放列表默认长期有效
+• 📱 最多3台设备同时使用
+• 🔐 加密链接保护
+• ⚡ 智能限制管理
+
+⏳ **使用限制：**
+• 📊 5小时内最多刷新6次
+• 🎯 超过6次刷新将暂时失效
+• 🔄 24小时内最多生成${this.config.telegram?.maxTokensPerUser || 2}次token
+
+🎯 **Token状态：**
+• 今日已生成: ${limitCheck.count || 0}/${this.config.telegram?.maxTokensPerUser || 2} 次
+• 重置时间: ${limitCheck.resetTime ? new Date(limitCheck.resetTime).toLocaleString('zh-CN') : '暂无'}
+
+🔄 **管理命令：**
+• \`/mycredentials\` - 查看凭据信息
+• \`/gettoken\` - 重新生成token
+• \`/revoke\` - 撤销访问权限
+        `;
+            
+            await this.bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+            
+        } catch (error) {
+            console.error('Error fetching user status:', error);
+            await this.bot.sendMessage(chatId, '❌ 获取状态信息时发生错误，请稍后重试。');
+        }
+    }
+    
+    // 新增：处理管理员面板命令
+    async handleAdminPanel(msg) {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        
+        // 只在私聊中处理
+        if (msg.chat.type !== 'private') {
+            await this.bot.sendMessage(chatId, '🔒 请私聊机器人使用管理员命令。');
+            return;
+        }
+        
+        // 验证管理员权限
+        if (!this.isAdmin(userId)) {
+            await this.bot.sendMessage(chatId, '❌ 此命令仅限管理员使用。');
+            return;
+        }
+        
+        const adminPanelMessage = `
+🛠️ **管理员控制面板**
+
+📊 **系统管理：**
+• \`/refresh\` - 手动刷新原始服务器
+• \`/admin stats\` - 查看系统统计信息
+• \`/admin list\` - 查看所有用户列表
+• \`/admin cleanup\` - 清理过期数据
+
+👥 **用户管理：**
+• \`/admin delete <用户名>\` - 删除指定用户
+• \`/admin delete_id <Telegram用户ID>\` - 按ID删除用户
+
+👑 **管理员管理：**
+• \`/addadmin <用户ID>\` - 添加新管理员
+• \`/removeadmin <用户ID>\` - 移除管理员
+• \`/listadmins\` - 查看管理员列表
+
+💾 **数据管理：**
+• \`/admin backup\` - 备份用户数据
+• \`/admin restore\` - 恢复用户数据
+
+🔄 **快捷命令：**
+直接发送以下命令：
+• \`/refresh\` - 快速刷新服务器
+
+💡 **当前状态：**
+• 当前管理员: ${this.getAllAdminIds().length} 人
+• 您的ID: \`${userId}\`
+• 服务器运行正常 ✅
+• 自动刷新: ${this.config.originalServer?.enableAutoRefresh ? '已启用' : '已禁用'}
+    `;
+        
+        await this.bot.sendMessage(chatId, adminPanelMessage, { parse_mode: 'Markdown' });
+    }
+    
+    // 新增：处理管理员刷新命令
+    async handleRefreshCommand(msg) {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        
+        // 只在私聊中处理
+        if (msg.chat.type !== 'private') {
+            await this.bot.sendMessage(chatId, '🔒 请私聊机器人使用此命令。');
+            return;
+        }
+        
+        // 验证管理员权限
+        if (!this.isAdmin(userId)) {
+            await this.bot.sendMessage(chatId, '❌ 此命令仅限管理员使用。');
+            return;
+        }
+        
+        try {
+            await this.bot.sendMessage(chatId, '🔄 正在手动刷新原始服务器，请稍候...');
+            
+            // 调用服务器刷新方法
+            const result = await this.userManager.refreshOriginalServer();
+            
+            if (result.success) {
+                // 简化消息，只显示基本统计信息
+                const successMessage = `✅ 原始服务器刷新成功
+
+📊 已加载 ${result.channelCount} 个频道，共 ${result.categoryCount} 个分类
+⏰ 刷新时间: ${result.refreshTime}`;
+                
+                await this.bot.sendMessage(chatId, successMessage);
+                
+            } else {
+                const errorMessage = `❌ 原始服务器刷新失败
+
+错误信息: ${result.error}
+失败时间: ${result.refreshTime}`;
+                
+                await this.bot.sendMessage(chatId, errorMessage);
+            }
+            
+        } catch (error) {
+            console.error('Error handling refresh command:', error);
+            await this.bot.sendMessage(chatId, `❌ 执行刷新命令时发生错误：${error.message}`);
+        }
+    }
+    
+    // 新增：处理检查管理员状态命令（调试用）
+    async handleCheckAdminCommand(msg) {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        
+        if (msg.chat.type !== 'private') {
+            return;
+        }
+        
+        const isAdmin = this.isAdmin(userId);
+        const adminIds = this.getAllAdminIds();
+        
+        const checkMessage = `
+🔍 **管理员身份检测**
+
+👤 **您的信息：**
+• 用户ID: \`${userId}\`
+• 是否为管理员: ${isAdmin ? '✅ 是' : '❌ 否'}
+
+📋 **系统管理员列表：**
+${adminIds.map((id, index) => `${index + 1}. \`${id}\` ${id === userId.toString() ? '👤 (您)' : ''}`).join('\n')}
+
+⚙️ **配置信息：**
+• 管理员总数: ${adminIds.length}
+• 旧格式管理员: ${this.config.adminUserId || '未设置'}
+• 新格式管理员: ${this.config.adminUserIds ? this.config.adminUserIds.join(', ') : '未设置'}
+
+${isAdmin ? 
+    '✅ 您拥有管理员权限，可以使用所有管理员命令。' : 
+    '❌ 您没有管理员权限，只能使用普通用户命令。'
+}
+    `;
+        
+        await this.bot.sendMessage(chatId, checkMessage, { parse_mode: 'Markdown' });
     }
     
     // 启动所有定时任务
