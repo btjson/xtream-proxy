@@ -2,3 +2,7 @@ config.json
 data/
 node_modules/
 package-lock.json
+REFACTORING_SUMMARY.md
+docker-compose.yml
+Dockerfile
+config.json.example
