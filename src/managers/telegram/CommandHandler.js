@@ -7,7 +7,14 @@ class CommandHandler {
     }
     
     getServerUrl() {
-        return `http://localhost:${this.serverConfig.port}`;
+        // 优先使用配置中的外部URL，否则使用localhost
+        if (this.config.server?.externalUrl) {
+            return this.config.server.externalUrl;
+        }
+        
+        // 如果配置了host且不是0.0.0.0，使用配置的host
+        const host = this.serverConfig.host === '0.0.0.0' ? 'localhost' : this.serverConfig.host;
+        return `http://${host}:${this.serverConfig.port}`;
     }
     
     async handleStart(msg, bot) {
@@ -151,7 +158,7 @@ class CommandHandler {
             // 重置用户的每小时播放列表刷新限制
             this.userManager.resetUserHourlyLimit(username);
             
-            const serverUrl = this.getServerUrl();
+            const serverUrl = this.userManager.getServerUrl();
             
             // 只发送M3U Plus播放列表链接
             const message = `🎉 令牌验证成功！您的登录凭据：
@@ -227,7 +234,7 @@ class CommandHandler {
 ⏰ *运行时间*: ${hours}小时 ${minutes}分钟
 👥 *总用户数*: ${this.userManager.getUserCount()}
 💾 *内存使用*: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB
-🌐 *服务器地址*: ${this.getServerUrl()}
+🌐 *服务器地址*: ${this.userManager.getServerUrl()}
 
 📈 *服务统计:*
 • 活跃用户: ${this.userManager.getActiveUsers().length}
