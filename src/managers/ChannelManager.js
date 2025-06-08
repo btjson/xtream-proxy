@@ -31,7 +31,18 @@ class ChannelManager {
     
     async loadChannels() {
         try {
-            // 首先尝试从缓存加载
+            // 检查是否有有效的URL配置
+            const hasValidUrl = this.config.originalServer?.url && 
+                               this.config.originalServer.url !== 'http://example.com' &&
+                               this.config.originalServer.url !== '';
+            
+            if (hasValidUrl) {
+                // 如果有有效URL，优先从服务器刷新
+                await this.refreshChannels();
+                return;
+            }
+            
+            // 如果没有有效URL，尝试从缓存加载
             if (this.config.features.cacheChannels && fs.existsSync(this.channelsFile)) {
                 const cacheData = JSON.parse(fs.readFileSync(this.channelsFile, 'utf8'));
                 const cacheAge = Date.now() - cacheData.timestamp;
@@ -46,8 +57,8 @@ class ChannelManager {
                 }
             }
             
-            // 从原始服务器加载
-            await this.refreshChannels();
+            // 如果没有缓存或缓存过期，创建示例频道
+            this.createSampleChannels();
             
         } catch (error) {
             this.logger.error('Error loading channels:', error);
@@ -292,6 +303,11 @@ class ChannelManager {
         return this.channels;
     }
     
+    updateConfig(newConfig) {
+        this.config = newConfig;
+        this.logger.info('ChannelManager configuration updated');
+    }
+
     getServerInfo() {
         return {
             url: this.config.originalServer.url,

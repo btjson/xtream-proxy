@@ -6,3 +6,5 @@ REFACTORING_SUMMARY.md
 docker-compose.yml
 Dockerfile
 config.json.example
+doc/
+test/

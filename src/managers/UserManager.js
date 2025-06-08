@@ -147,6 +147,15 @@ class UserManager {
             return false;
         }
         
+        // 检查用户是否过期
+        if (user.expiryTime && Date.now() > user.expiryTime) {
+            this.logger.warn(`Authentication failed: User ${username} has expired`);
+            // 禁用过期用户
+            user.enabled = false;
+            this.saveUsers();
+            return false;
+        }
+        
         if (user.password !== password) {
             this.logger.warn(`Authentication failed: Invalid password for user ${username}`);
             return false;
@@ -197,15 +206,19 @@ class UserManager {
     }
 
     createTelegramUser(username, password, telegramUserId) {
+        const expiryTime = Date.now() + (this.config.playlist?.userLinkExpiry || 86400000); // 24小时后过期
         const user = this.createUser(username, password, {
             telegramUserId: telegramUserId,
-            source: 'telegram'
+            source: 'telegram',
+            expiryTime: expiryTime,
+            expiryNotified: false
         });
         
         this.telegramUsers.set(username, {
             telegramUserId: telegramUserId,
             username: username,
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            expiryTime: expiryTime
         });
         
         return user;
@@ -260,20 +273,42 @@ class UserManager {
         return true;
     }
 
-    // 检查流并发限制
+    // 检查流并发限制 - 修复并发检查逻辑
     checkStreamConcurrency(username, channelId, clientIP) {
-        const streamKey = `${username}:${channelId}`;
-        const connections = this.streamConnections.get(streamKey) || new Set();
+        // 先清理不活跃的流（5分钟不活跃就清理）
+        this.cleanupUserInactiveStreams(username);
         
-        // 最大3个设备同时播放
-        if (connections.size >= 3 && !connections.has(clientIP)) {
+        // 检查是否是同一设备访问同一频道（允许重复连接）
+        const sessionKey = `${channelId}:${clientIP}`;
+        for (const [streamId, stream] of this.activeStreams.entries()) {
+            if (stream.username === username && 
+                stream.channelId === channelId && 
+                stream.clientIP === clientIP) {
+                // 同一设备访问同一频道，更新最后活动时间并返回现有会话ID
+                stream.lastActivity = Date.now();
+                console.log(`🔄 ${username} 重用现有会话 ${channelId} from ${clientIP}`);
+                return streamId;
+            }
+        }
+        
+        // 统计该用户当前的活跃流数量（去重计算设备数）
+        const userDevices = new Set();
+        for (const [streamId, stream] of this.activeStreams.entries()) {
+            if (stream.username === username) {
+                userDevices.add(stream.clientIP);
+            }
+        }
+        
+        console.log(`📊 ${username} 当前活跃设备数: ${userDevices.size}/3`);
+        
+        // 检查用户总并发限制（最大3个设备同时播放）
+        if (userDevices.size >= 3 && !userDevices.has(clientIP)) {
+            console.log(`⚠️  ${username} 设备并发限制超出: ${userDevices.size} 设备已在线`);
+            this.showUserActiveStreams(username);
             return false;
         }
         
-        connections.add(clientIP);
-        this.streamConnections.set(streamKey, connections);
-        
-        // 记录活跃流
+        // 记录新的活跃流
         const streamId = uuidv4();
         this.activeStreams.set(streamId, {
             username,
@@ -283,8 +318,35 @@ class UserManager {
             lastActivity: Date.now()
         });
         
+        console.log(`✅ ${username} 新建流会话 ${channelId} from ${clientIP} (设备: ${userDevices.size + (userDevices.has(clientIP) ? 0 : 1)}/3)`);
+        
+        // 保持向后兼容的streamConnections结构（用于其他功能）
+        const streamKey = `${username}:${channelId}`;
+        const connections = this.streamConnections.get(streamKey) || new Set();
+        connections.add(clientIP);
+        this.streamConnections.set(streamKey, connections);
+        
         this.saveUserLimits();
         return streamId;
+    }
+
+    // 清理特定用户的不活跃流
+    cleanupUserInactiveStreams(username) {
+        const now = Date.now();
+        const inactiveThreshold = 5 * 60 * 1000; // 5分钟不活跃
+        let cleanedCount = 0;
+        
+        for (const [streamId, stream] of this.activeStreams.entries()) {
+            if (stream.username === username && now - stream.lastActivity > inactiveThreshold) {
+                this.activeStreams.delete(streamId);
+                cleanedCount++;
+                console.log(`🧹 清理 ${username} 不活跃流: ${stream.channelId} from ${stream.clientIP}`);
+            }
+        }
+        
+        if (cleanedCount > 0) {
+            console.log(`🧹 ${username} 清理了 ${cleanedCount} 个不活跃流`);
+        }
     }
 
     // 移除流连接
@@ -302,11 +364,18 @@ class UserManager {
         }
         
         // 清理活跃流记录
+        let removed = false;
         for (const [streamId, stream] of this.activeStreams.entries()) {
             if (stream.username === username && stream.channelId === channelId && stream.clientIP === clientIP) {
                 this.activeStreams.delete(streamId);
+                removed = true;
+                console.log(`🗑️  ${username} 移除流连接: ${channelId} from ${clientIP}`);
                 break;
             }
+        }
+        
+        if (!removed) {
+            console.log(`⚠️  ${username} 未找到要移除的流连接: ${channelId} from ${clientIP}`);
         }
         
         this.saveUserLimits();
@@ -404,10 +473,10 @@ class UserManager {
         return playlist;
     }
 
-    // 生成加密的频道链接
+    // 生成加密的频道链接 - 修改参数，不传递clientIP到加密函数
     generateEncryptedChannelUrl(originalUrl, username, channelId, clientIP) {
         const serverUrl = this.getServerUrl();
-        const encryptedToken = this.encryptChannelUrl(originalUrl, username, channelId, clientIP, 120);
+        const encryptedToken = this.encryptChannelUrl(originalUrl, username, channelId, 120);
         const encryptedUrl = `${serverUrl}/live/encrypted/${encryptedToken}?username=${username}`;
         return encryptedUrl;
     }
@@ -421,12 +490,12 @@ class UserManager {
         return this.encryptionKeyBuffer;
     }
 
-    encryptChannelUrl(originalUrl, username, channelId, clientIP, expiryMinutes = 120) {
+    // 修改加密函数，移除clientIP参数
+    encryptChannelUrl(originalUrl, username, channelId, expiryMinutes = 120) {
         const payload = {
             url: originalUrl,
             username: username,
             channelId: channelId,
-            clientIP: clientIP,
             expiresAt: Date.now() + (expiryMinutes * 60 * 1000),
             tokenId: uuidv4()
         };
@@ -483,18 +552,17 @@ class UserManager {
             return this.validateTokenPayload(payload, username, clientIP);
             
         } catch (error) {
-            // 只在关键错误时输出日志
-            if (error.message === 'User not found' || error.message === 'User disabled') {
-                console.log(`❌ ${username} 访问被拒绝: ${error.message}`);
-            }
-            this.logger.error('Token decryption failed:', error);
+            // 优化错误处理 - 避免显示堆栈跟踪
+            const errorMessage = error.message || 'Unknown error';
             
-            // 保持原始错误信息，特别是用户验证相关的错误
-            if (error.message === 'User not found' || 
-                error.message === 'User disabled' || 
-                error.message === 'Token expired' || 
-                error.message === 'IP mismatch' || 
-                error.message === 'Invalid username') {
+            // 只记录错误消息，不显示完整堆栈跟踪
+            this.logger.error(`Token decryption failed for user ${username}: ${errorMessage}`);
+            
+            // 保持原始错误信息，移除IP mismatch错误
+            if (errorMessage === 'User not found' || 
+                errorMessage === 'User disabled' || 
+                errorMessage === 'Token expired' || 
+                errorMessage === 'Invalid username') {
                 throw error;
             }
             
@@ -513,10 +581,10 @@ class UserManager {
             throw new Error('Invalid username');
         }
         
-        // 验证IP地址匹配
-        if (payload.clientIP !== clientIP) {
-            throw new Error('IP mismatch');
-        }
+        // 移除IP验证 - 只保留注释
+        // if (payload.clientIP !== clientIP) {
+        //     throw new Error('IP mismatch');
+        // }
         
         // 🔒 关键安全检查：验证用户是否仍然存在且启用
         const user = this.users[username];
@@ -595,6 +663,32 @@ class UserManager {
         this.saveUserLimits();
         console.log(`🔄 ${username} 每小时限制已重置`);
         this.logger.info(`User ${username} hourly limit reset`);
+    }
+
+    // 调试：显示用户的活跃流状态
+    showUserActiveStreams(username) {
+        const userStreams = [];
+        const userDevices = new Set();
+        
+        for (const [streamId, stream] of this.activeStreams.entries()) {
+            if (stream.username === username) {
+                userStreams.push({
+                    streamId: streamId.substring(0, 8),
+                    channelId: stream.channelId,
+                    clientIP: stream.clientIP,
+                    age: Math.floor((Date.now() - stream.startTime) / 1000),
+                    inactive: Math.floor((Date.now() - stream.lastActivity) / 1000)
+                });
+                userDevices.add(stream.clientIP);
+            }
+        }
+        
+        console.log(`📊 ${username} 活跃流状态: ${userDevices.size} 设备, ${userStreams.length} 流`);
+        userStreams.forEach(stream => {
+            console.log(`   - ${stream.streamId}: ${stream.channelId} from ${stream.clientIP} (存活${stream.age}s, 不活跃${stream.inactive}s)`);
+        });
+        
+        return { devices: userDevices.size, streams: userStreams.length };
     }
 
     cleanup() {

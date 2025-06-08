@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
+
+
 module.exports = (userManager, channelManager, securityManager) => {
     
     // 处理直播流请求
@@ -21,10 +23,10 @@ module.exports = (userManager, channelManager, securityManager) => {
             // 检查并发限制
             const streamSessionId = userManager.checkStreamConcurrency(username, streamId, clientIP);
             if (!streamSessionId) {
-                console.log(`⚠️  Concurrent stream limit exceeded for ${username}:${streamId}`);
+                console.log(`⚠️  Concurrent stream limit exceeded for ${username} (3 devices total)`);
                 return res.status(429).json({
                     error: 'Concurrent stream limit exceeded',
-                    message: 'Maximum 3 devices can watch the same channel simultaneously'
+                    message: 'Maximum 3 devices can stream simultaneously per user'
                 });
             }
             
@@ -49,15 +51,17 @@ module.exports = (userManager, channelManager, securityManager) => {
     
     // 处理加密的流重定向
     router.get('/encrypted/:token', async (req, res) => {
+        // 将变量声明提到外层，确保在catch块中可以访问
+        const { token } = req.params;
+        const { username } = req.query;
+        const clientIP = securityManager.getClientIP(req);
+        
         try {
-            const { token } = req.params;
-            const { username } = req.query;
-            const clientIP = securityManager.getClientIP(req);
-            
             // 解密token并验证
             const payload = userManager.decryptChannelToken(token, username, clientIP);
             
             if (!payload) {
+                console.log(`🚫 ${username || 'Unknown'} 访问被拒绝: Invalid token from ${clientIP}`);
                 return res.status(401).json({
                     error: 'Invalid or expired token',
                     message: 'Token has expired or is invalid'
@@ -67,51 +71,63 @@ module.exports = (userManager, channelManager, securityManager) => {
             // 检查并发限制
             const streamSessionId = userManager.checkStreamConcurrency(username, payload.channelId, clientIP);
             if (!streamSessionId) {
-                console.log(`⚠️  ${username} 并发限制超出`);
+                console.log(`⚠️  ${username} 并发限制超出 from ${clientIP} (3 devices total)`);
                 return res.status(429).json({
                     error: 'Concurrent stream limit exceeded', 
-                    message: 'Maximum 3 devices can watch the same channel simultaneously'
+                    message: 'Maximum 3 devices can stream simultaneously per user'
                 });
             }
             
-            // 记录流访问 - 简化日志
-            console.log(`📺 ${username} -> 频道${payload.channelId}`);
+            // 记录流访问 - 简化日志输出
+            console.log(`📺 ${username} -> 频道${payload.channelId} from ${clientIP}`);
             userManager.logger.info(`Stream access: ${username} -> ${payload.channelId} from ${clientIP}`);
             
             // 302重定向到真实的流URL
             res.redirect(302, payload.url);
             
         } catch (error) {
-            // 根据错误类型提供不同的响应
-            if (error.message === 'Token expired') {
+            // 优化错误处理 - 根据错误类型提供简洁的提示
+            const errorMessage = error.message || 'Unknown error';
+            
+            if (errorMessage === 'Token expired') {
+                console.log(`⏰ ${username || 'Unknown'} Token已过期 from ${clientIP}`);
                 return res.status(401).json({
                     error: 'Token expired',
                     message: 'Please refresh your playlist to get new links'
                 });
             }
             
-            if (error.message === 'IP mismatch') {
-                return res.status(403).json({
-                    error: 'IP mismatch',
-                    message: 'Stream can only be accessed from the same IP that requested the playlist'
-                });
-            }
-            
-            if (error.message === 'User not found') {
+            if (errorMessage === 'User not found') {
+                console.log(`🚫 ${username || 'Unknown'} 用户不存在 from ${clientIP}`);
+                userManager.logger.warn(`Access denied for non-existent user: ${username} from ${clientIP}`);
                 return res.status(403).json({
                     error: 'User not found',
                     message: 'Your account has been removed. Please contact administrator.'
                 });
             }
             
-            if (error.message === 'User disabled') {
+            if (errorMessage === 'User disabled') {
+                console.log(`🔒 ${username || 'Unknown'} 账户已禁用 from ${clientIP}`);
+                userManager.logger.warn(`Access denied for disabled user: ${username} from ${clientIP}`);
                 return res.status(403).json({
                     error: 'Account disabled',
                     message: 'Your account has been disabled. Please contact administrator.'
                 });
             }
             
-            res.status(401).json({
+            if (errorMessage === 'Invalid username') {
+                console.log(`❌ ${username || 'Unknown'} 用户名不匹配 from ${clientIP}`);
+                return res.status(401).json({
+                    error: 'Invalid username',
+                    message: 'Token does not match the provided username'
+                });
+            }
+            
+            // 其他未知错误 - 不显示详细堆栈跟踪
+            console.log(`❌ ${username || 'Unknown'} Token解密失败: ${errorMessage} from ${clientIP}`);
+            userManager.logger.error(`Token decryption failed for user ${username}: ${errorMessage}`);
+            
+            return res.status(401).json({
                 error: 'Invalid token',
                 message: 'Token is invalid or malformed'
             });

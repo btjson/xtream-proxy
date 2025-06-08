@@ -65,7 +65,8 @@ class XtreamCodesProxy {
         // 请求日志中间件
         if (this.config.security.enableLogging) {
             this.app.use((req, res, next) => {
-                this.logger.info(`${req.method} ${req.url} - ${req.ip}`);
+                const truncatedUrl = Logger.truncateUrlForLogging(req.url);
+                this.logger.info(`${req.method} ${truncatedUrl} - ${req.ip}`);
                 next();
             });
         }
@@ -309,5 +310,7 @@ class XtreamCodesProxy {
         }
     }
 }
+
+
 
 module.exports = XtreamCodesProxy; 

@@ -23,6 +23,9 @@ class AdminHandler {
             case 'cleanup':
                 await this.handleCleanup(msg, bot);
                 break;
+            case 'changem3u':
+                await this.handleChangeM3U(msg, bot, args.slice(1));
+                break;
             default:
                 await this.showAdminHelp(msg, bot);
         }
@@ -34,8 +37,11 @@ class AdminHandler {
 • /admin stats - 查看系统统计
 • /admin users - 查看用户列表
 • /admin cleanup - 清理过期数据
+• /changem3u <新的M3U链接> - 修改M3U订阅链接
 
-使用示例：/admin stats`;
+使用示例：
+• /admin stats
+• /changem3u https://example.com/playlist.m3u`;
         
         await bot.sendMessage(msg.chat.id, help);
     }
@@ -103,6 +109,129 @@ class AdminHandler {
         } catch (error) {
             await bot.sendMessage(msg.chat.id, `❌ 清理失败：${error.message}`);
         }
+    }
+    
+    async handleChangeM3U(msg, bot, args) {
+        if (args.length === 0) {
+            const currentUrl = this.config.originalServer?.url || '未设置';
+            const channelCount = this.userManager.channelManager ? 
+                this.userManager.channelManager.getChannelCount() : 0;
+            
+            await bot.sendMessage(msg.chat.id, `📺 **当前M3U订阅链接管理：**
+
+🔗 **当前链接**：
+\`${currentUrl}\`
+
+📊 **当前状态**：
+• **频道数量**：${channelCount}
+• **链接状态**：${currentUrl !== '未设置' ? '✅ 已配置' : '❌ 未配置'}
+
+💡 **使用方法**：
+\`/changem3u <新的M3U链接>\`
+
+📝 **示例**：
+\`/changem3u https://example.com/playlist.m3u\`
+
+⚠️ **注意**：修改后将自动刷新频道列表并更新所有用户的播放列表`, { parse_mode: 'Markdown' });
+            return;
+        }
+
+        const newUrl = args.join(' ').trim();
+        
+        // 验证URL格式
+        if (!this.isValidUrl(newUrl)) {
+            await bot.sendMessage(msg.chat.id, `❌ **无效的URL格式**
+
+请提供有效的HTTP/HTTPS链接，例如：
+\`https://example.com/playlist.m3u\``, { parse_mode: 'Markdown' });
+            return;
+        }
+
+        const oldUrl = this.config.originalServer?.url || '未设置';
+        
+        try {
+            await bot.sendMessage(msg.chat.id, `🔄 **正在更新M3U订阅链接...**
+
+📡 **旧链接**：\`${oldUrl}\`
+🆕 **新链接**：\`${newUrl}\`
+
+请稍候，正在测试新链接并刷新频道列表...`, { parse_mode: 'Markdown' });
+
+            // 更新配置
+            await this.updateM3UUrl(newUrl);
+            
+            // 更新ChannelManager的配置引用
+            if (this.userManager.channelManager && this.userManager.channelManager.updateConfig) {
+                this.userManager.channelManager.updateConfig(this.config);
+            }
+            
+            // 刷新频道列表
+            if (this.userManager.channelManager && this.userManager.channelManager.refreshChannels) {
+                await this.userManager.channelManager.refreshChannels();
+                
+                const channelCount = this.userManager.channelManager.getChannelCount ? 
+                    this.userManager.channelManager.getChannelCount() : '未知';
+                
+                await bot.sendMessage(msg.chat.id, `✅ **M3U订阅链接更新成功！**
+
+📺 **新链接**：\`${newUrl}\`
+🔄 **频道列表已自动刷新**
+📊 **当前频道数量**：${channelCount}
+
+💡 **重要提醒**：所有用户需要重新获取播放列表才能看到更新的频道。`, { parse_mode: 'Markdown' });
+                
+                this.logger.info(`管理员 ${msg.from.id} 更新了M3U链接: ${oldUrl} -> ${newUrl}`);
+            } else {
+                await bot.sendMessage(msg.chat.id, `✅ **M3U订阅链接已更新！**
+
+📺 **新链接**：\`${newUrl}\`
+
+⚠️ **警告**：频道管理器不可用，请手动刷新频道列表。`, { parse_mode: 'Markdown' });
+            }
+            
+        } catch (error) {
+            this.logger.error('更新M3U链接失败:', error);
+            await bot.sendMessage(msg.chat.id, `❌ **更新M3U链接失败：**
+
+**错误信息**：${error.message}
+
+**可能的原因**：
+• 新链接无法访问
+• 链接格式不正确
+• 网络连接问题
+
+**解决方案**：请检查链接是否有效后重试。`, { parse_mode: 'Markdown' });
+        }
+    }
+
+    isValidUrl(string) {
+        try {
+            const url = new URL(string);
+            return url.protocol === 'http:' || url.protocol === 'https:';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async updateM3UUrl(newUrl) {
+        // 更新内存中的配置
+        if (!this.config.originalServer) {
+            this.config.originalServer = {};
+        }
+        this.config.originalServer.url = newUrl;
+        
+        // 保存配置到文件并重新加载
+        const ConfigManager = require('../../utils/ConfigManager');
+        const configManager = new ConfigManager();
+        configManager.set('originalServer.url', newUrl);
+        
+        // 重新加载配置以确保所有引用都更新
+        const updatedConfig = configManager.getConfig();
+        
+        // 更新当前配置引用
+        Object.assign(this.config, updatedConfig);
+        
+        this.logger.info(`M3U URL updated to: ${newUrl}`);
     }
     
     splitMessage(message, maxLength) {

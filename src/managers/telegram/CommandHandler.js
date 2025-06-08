@@ -49,8 +49,6 @@ class CommandHandler {
 • /help - 显示此帮助信息
 • /gettoken - 获取临时访问令牌
 • /mycredentials - 查看我的登录凭据
-• /status - 查看服务器运行状态
-• /refresh - 刷新频道列表
 • /revoke - 撤销访问权限
 
 🔑 *获取访问权限流程:*
@@ -153,12 +151,40 @@ class CommandHandler {
         const password = this.generatePassword();
         
         try {
-            this.userManager.createTelegramUser(username, password, userId);
+            // 检查用户是否已存在，如果存在则更新过期时间
+            const existingUsers = this.userManager.getUsers();
+            let existingUsername = null;
+            
+            for (const [uname, user] of Object.entries(existingUsers)) {
+                if (user.telegramUserId === userId) {
+                    existingUsername = uname;
+                    break;
+                }
+            }
+            
+            if (existingUsername) {
+                // 用户已存在，更新过期时间和重置通知状态
+                const newExpiryTime = Date.now() + (this.userManager.config.playlist?.userLinkExpiry || 86400000);
+                this.userManager.updateUser(existingUsername, {
+                    expiryTime: newExpiryTime,
+                    expiryNotified: false,
+                    enabled: true
+                });
+                username = existingUsername;
+                password = existingUsers[existingUsername].password;
+            } else {
+                // 创建新用户
+                this.userManager.createTelegramUser(username, password, userId);
+            }
             
             // 重置用户的每小时播放列表刷新限制
             this.userManager.resetUserHourlyLimit(username);
             
             const serverUrl = this.userManager.getServerUrl();
+            
+            // 计算过期时间
+            const user = this.userManager.getUsers()[username];
+            const expiryTime = new Date(user.expiryTime);
             
             // 只发送M3U Plus播放列表链接
             const message = `🎉 令牌验证成功！您的登录凭据：
@@ -167,7 +193,14 @@ class CommandHandler {
 
 \`${serverUrl}/get.php?username=${username}&password=${password}&type=m3u_plus\`
 
-（复制此链接到您的IPTV播放器）`;
+⏰ 链接有效期：24小时
+📅 过期时间：${expiryTime.toLocaleString()}
+
+💡 提示：
+• 复制上述链接到您的IPTV播放器
+• 链接在24小时后自动失效
+• 过期前机器人会自动提醒您
+• 需要续期时请重新获取token`;
             
             await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
             
@@ -211,14 +244,40 @@ class CommandHandler {
         
         const serverUrl = this.userManager.getServerUrl();
         
+        // 检查用户是否过期
+        if (userCredentials.expiryTime && Date.now() > userCredentials.expiryTime) {
+            await bot.sendMessage(msg.chat.id, `❌ 您的访问权限已过期
+
+🔄 重新获取访问权限：
+1. 使用 /gettoken 命令获取新的访问令牌
+2. 在私聊中发送令牌进行验证
+3. 验证成功后获得新的24小时访问权限`);
+            return;
+        }
+        
+        const expiryTime = userCredentials.expiryTime ? new Date(userCredentials.expiryTime) : null;
+        const timeLeft = expiryTime ? Math.max(0, Math.floor((userCredentials.expiryTime - Date.now()) / (60 * 60 * 1000))) : null;
+        
         // 只显示M3U Plus播放列表链接
-        const message = `🎉 您的登录凭据：
+        let message = `🎉 您的登录凭据：
 
 📺 M3U Plus播放列表链接：
 
-\`${serverUrl}/get.php?username=${foundUsername}&password=${userCredentials.password}&type=m3u_plus\`
+\`${serverUrl}/get.php?username=${foundUsername}&password=${userCredentials.password}&type=m3u_plus\``;
 
-（复制此链接到您的IPTV播放器）`;
+        if (expiryTime && timeLeft !== null) {
+            message += `
+
+⏰ 链接状态：${timeLeft > 0 ? '有效' : '已过期'}
+📅 过期时间：${expiryTime.toLocaleString()}
+⏳ 剩余时间：${timeLeft > 0 ? `${timeLeft} 小时` : '已过期'}
+
+💡 提示：链接过期后请使用 /gettoken 重新获取`;
+        } else {
+            message += `
+
+💡 提示：复制上述链接到您的IPTV播放器`;
+        }
         
         await bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
     }
@@ -227,6 +286,12 @@ class CommandHandler {
         const uptime = process.uptime();
         const hours = Math.floor(uptime / 3600);
         const minutes = Math.floor((uptime % 3600) / 60);
+        
+        // 获取频道数量
+        const channelCount = this.userManager.channelManager ? 
+            this.userManager.channelManager.getChannelCount() : 0;
+        const categoryCount = this.userManager.channelManager ? 
+            this.userManager.channelManager.getCategoryCount() : 0;
         
         const status = `📊 服务器状态报告：
 
@@ -238,7 +303,8 @@ class CommandHandler {
 
 📈 *服务统计:*
 • 活跃用户: ${this.userManager.getActiveUsers().length}
-• 频道总数: 正在统计...
+• 频道总数: ${channelCount}
+• 频道分类: ${categoryCount}
 • 系统负载: 正常
 
 ✅ *系统状态*: 所有服务运行正常
@@ -249,39 +315,49 @@ class CommandHandler {
     }
     
     async handleRefresh(msg, bot) {
-        // 检查是否为管理员
         const userId = msg.from.id;
         const isAdmin = this.isAdmin(userId);
         
-        if (!isAdmin) {
-            await bot.sendMessage(msg.chat.id, `❌ 权限不足
-
-🔒 此命令仅限管理员使用
-💡 如需刷新播放列表，请直接重新获取播放列表链接`);
-            return;
-        }
+        // 管理员和普通用户都可以使用，但显示不同的消息
+        const userType = isAdmin ? '管理员' : '用户';
         
-        await bot.sendMessage(msg.chat.id, `🔄 管理员操作：正在刷新频道列表...
+        await bot.sendMessage(msg.chat.id, `🔄 ${userType}操作：正在刷新频道列表...
 
 请稍候，这可能需要几秒钟时间。`);
         
         try {
-            // 这里可以调用频道管理器的刷新方法
+            // 调用频道管理器的刷新方法
             if (this.userManager.channelManager && this.userManager.channelManager.refreshChannels) {
+                const oldChannelCount = this.userManager.channelManager.getChannelCount();
                 await this.userManager.channelManager.refreshChannels();
+                const newChannelCount = this.userManager.channelManager.getChannelCount();
+                
+                const message = isAdmin ? 
+                    `✅ 管理员操作完成：频道列表刷新成功！
+
+📺 频道数量：${oldChannelCount} → ${newChannelCount}
+🔄 频道列表已更新到最新版本
+📊 所有用户需要重新获取播放列表才能看到更新
+
+💡 用户可以通过重新访问播放列表链接获取最新频道。` :
+                    `✅ 频道列表刷新成功！
+
+📺 频道数量：${newChannelCount}
+🔄 频道列表已更新
+💡 请重新获取播放列表链接以查看最新频道
+
+📋 使用 /mycredentials 获取您的播放列表链接`;
+                
+                await bot.sendMessage(msg.chat.id, message);
+            } else {
+                await bot.sendMessage(msg.chat.id, `❌ 频道管理器不可用
+
+请联系管理员检查服务器状态。`);
             }
-            
-            await bot.sendMessage(msg.chat.id, `✅ 管理员操作完成：频道列表刷新成功！
-
-📺 频道列表已更新到最新版本
-🔄 用户需要重新获取播放列表才能看到更新
-📊 建议通知用户刷新播放器缓存
-
-💡 用户可以通过重新访问播放列表链接获取最新频道。`);
         } catch (error) {
-            await bot.sendMessage(msg.chat.id, `❌ 管理员操作失败：${error.message}
+            await bot.sendMessage(msg.chat.id, `❌ 刷新操作失败：${error.message}
 
-请检查服务器状态或联系技术支持。`);
+请稍后重试或联系管理员。`);
         }
     }
     

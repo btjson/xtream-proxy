@@ -22,22 +22,23 @@ class Logger {
         return new Date().toISOString();
     }
     
-    log(level, message, data = null) {
-        const timestamp = this.formatTimestamp();
+    log(level, message, metadata = {}) {
+        const timestamp = new Date().toISOString();
         const logEntry = {
             timestamp,
-            level,
+            level: level.toUpperCase(),
             message,
-            data
+            ...metadata
         };
         
-        // 控制台输出
-        const coloredLevel = this.getColoredLevel(level);
-        console.log(`[${timestamp}] ${coloredLevel} ${message}`, data ? data : '');
+        // 只在控制台显示信息、警告和错误
+        if (['info', 'warn', 'error'].includes(level)) {
+            console.log(`[${logEntry.level}] ${logEntry.message}`);
+        }
         
-        // 文件输出
         if (this.enableLogging) {
-            this.writeToFile(logEntry);
+            const logLine = `${timestamp} [${level.toUpperCase()}] ${message}${Object.keys(metadata).length > 0 ? ' ' + JSON.stringify(metadata) : ''}\n`;
+            this.writeToFile(logLine);
         }
     }
     
@@ -56,11 +57,10 @@ class Logger {
         return `${color}[${level.toUpperCase()}]${reset}`;
     }
     
-    writeToFile(logEntry) {
+    writeToFile(logLine) {
         try {
             const logFileName = `app-${new Date().toISOString().split('T')[0]}.log`;
             const logFilePath = path.join(this.logsDir, logFileName);
-            const logLine = JSON.stringify(logEntry) + '\n';
             
             fs.appendFileSync(logFilePath, logLine);
         } catch (error) {
@@ -68,24 +68,24 @@ class Logger {
         }
     }
     
-    info(message, data = null) {
-        this.log('info', message, data);
+    info(message, metadata = {}) {
+        this.log('info', message, metadata);
     }
     
-    warn(message, data = null) {
-        this.log('warn', message, data);
+    warn(message, metadata = {}) {
+        this.log('warn', message, metadata);
     }
     
-    error(message, data = null) {
-        this.log('error', message, data);
+    error(message, metadata = {}) {
+        this.log('error', message, metadata);
     }
     
-    debug(message, data = null) {
-        this.log('debug', message, data);
+    debug(message, metadata = {}) {
+        this.log('debug', message, metadata);
     }
     
-    success(message, data = null) {
-        this.log('success', message, data);
+    success(message, metadata = {}) {
+        this.log('success', message, metadata);
     }
     
     // 清理旧日志文件
@@ -111,6 +111,33 @@ class Logger {
         } catch (error) {
             this.error('Error cleaning up old logs:', error);
         }
+    }
+    
+    // Utility function to truncate long URLs for logging
+    static truncateUrlForLogging(url) {
+        if (!url) return url;
+        
+        // Check if it's an encrypted token URL
+        if (url.includes('/live/encrypted/') || url.includes('/stream/encrypted/')) {
+            const parts = url.split('?');
+            const baseUrl = parts[0];
+            const queryParams = parts[1];
+            
+            // Extract the encrypted token path
+            const tokenMatch = baseUrl.match(/\/encrypted\/([^\/]+)/);
+            if (tokenMatch && tokenMatch[1].length > 50) {
+                const truncatedToken = tokenMatch[1].substring(0, 20) + '...[' + (tokenMatch[1].length - 40) + ' chars]...' + tokenMatch[1].substring(tokenMatch[1].length - 20);
+                const truncatedBaseUrl = baseUrl.replace(tokenMatch[1], truncatedToken);
+                return queryParams ? `${truncatedBaseUrl}?${queryParams}` : truncatedBaseUrl;
+            }
+        }
+        
+        // For other long URLs, truncate if longer than 150 characters
+        if (url.length > 150) {
+            return url.substring(0, 75) + '...[' + (url.length - 150) + ' chars]...' + url.substring(url.length - 75);
+        }
+        
+        return url;
     }
 }
 
