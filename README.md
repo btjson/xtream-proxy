@@ -54,6 +54,7 @@ nano config.json
 5. **启动服务**
 ```bash
 npm start
+nohup npm start &
 ```
 
 ## ⚙️ 配置说明
